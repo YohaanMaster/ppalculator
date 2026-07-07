@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>the ppalculator</title>
+    
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Load React, ReactDOM, and Babel (to compile the code in the browser) -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <style>
+        body { margin: 0; padding: 0; background-color: #0a0a0f; }
+    </style>
+</head>
+<body>
+    <!-- This is where the app will be drawn -->
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useMemo } = React;
+
+        const x = 1.45;
+        const b = 30;
+        const w = 0.9;
+        const MAX_PLAYS = 25;
+
+        // -------------------------------------------------------------
+        // Goldberries API integration
+        // -------------------------------------------------------------
+        const GB_API_BASE = "https://goldberries.net/api";
+
+        // Turns a /api/lists/top-golden-list response into a sorted,
+        // MAX_PLAYS-capped array of tiers. Each entry in `challenges` carries
+        // its own `difficulty.sort`, which is exactly the Tier number shown
+        // on goldberries (Tier 20 -> sort 20) - so no separate id-to-tier
+        // lookup is needed here, we just read it straight off each entry.
+        //
+        // A challenge is skipped if the player's only submission(s) for it
+        // are flagged `is_obsolete`. This happens when a submission gets
+        // superseded - e.g. a later Full Clear makes an earlier non-FC clear
+        // of the same map redundant - and goldberries' own tracker doesn't
+        // count those toward a player's Top 25 either.
+        const buildPlaysFromTopGoldenList = (listData) => {
+          const challenges = (listData && listData.challenges) || [];
+          const tiers = challenges
+            .filter((c) => {
+              const subs = c.submissions || [];
+              return subs.some((s) => !s.is_obsolete);
+            })
+            .map((c) => c.difficulty && c.difficulty.sort)
+            .filter((sort) => typeof sort === "number" && sort > 0);
+          return tiers.sort((a, b) => b - a).slice(0, MAX_PLAYS);
+        };
+
+        const getBasePP = (t) => {
+          return Math.pow(x, t) + (b * Math.pow(t, x)) + (b * t / 2);
+        };
+
+        const getWeightedPP = (t, i) => {
+          return getBasePP(t) * Math.pow(w, i);
+        };
+
+        const TIER_COLORS = {
+          1:  "#9696ff",
+          2:  "#93aeff",
+          3:  "#91c8ff",
+          4:  "#8eecff",
+          5:  "#8cffe2",
+          6:  "#89ffb0",
+          7:  "#9bff87",
+          8:  "#b7ff84",
+          9:  "#d5ff82",
+          10: "#f4ff7f",
+          11: "#fff47c",
+          12: "#ffdd7a",
+          13: "#ffc677",
+          14: "#ffae75",
+          15: "#ff9572",
+          16: "#ff7c70",
+          17: "#ff6d79",
+          18: "#ff6daa",
+          19: "#ff68d9",
+          20: "#f266ff",
+          21: "#d863ff",
+          22: "#bd60ff",
+          // Extrapolated: each step darkens/deepens by ~15 on the hex
+          23: "#a35dff",
+          24: "#8a5aff",
+          25: "#7057ff",
+        };
+
+        const getTierColor = (tier) => TIER_COLORS[tier] || "#ffffff";
+
+        function App() {
+          const [plays, setPlays] = useState([]);
+          const [isDraggingOver, setIsDraggingOver] = useState(false);
+
+          // Player lookup state
+          const [searchQuery, setSearchQuery] = useState("");
+          const [searchResults, setSearchResults] = useState([]);
+          const [isSearching, setIsSearching] = useState(false);
+          const [searchError, setSearchError] = useState(null);
+          const [showResults, setShowResults] = useState(false);
+
+          const [activePlayer, setActivePlayer] = useState(null);
+          const [isLoadingPlayer, setIsLoadingPlayer] = useState(false);
+          const [loadPlayerError, setLoadPlayerError] = useState(null);
+
+          const availableTiers = Array.from({ length: 25 }, (_, i) => i + 1).reverse();
+
+          // Debounced search-as-you-type against the goldberries player search
+          React.useEffect(() => {
+            const query = searchQuery.trim();
+            if (query.length < 2) {
+              setSearchResults([]);
+              setIsSearching(false);
+              setSearchError(null);
+              return;
+            }
+
+            setIsSearching(true);
+            setSearchError(null);
+            const timeoutId = setTimeout(async () => {
+              try {
+                const res = await fetch(
+                  `${GB_API_BASE}/search?q=${encodeURIComponent(query)}&in=players`
+                );
+                if (!res.ok) throw new Error(`Search failed (${res.status})`);
+                const data = await res.json();
+                setSearchResults(data.players || []);
+              } catch (err) {
+                setSearchError(
+                  "Couldn't reach the goldberries API right now. Try again in a moment."
+                );
+                setSearchResults([]);
+              } finally {
+                setIsSearching(false);
+              }
+            }, 350);
+
+            return () => clearTimeout(timeoutId);
+          }, [searchQuery]);
+
+          const loadPlayer = async (player) => {
+            setShowResults(false);
+            setSearchQuery("");
+            setIsLoadingPlayer(true);
+            setLoadPlayerError(null);
+            try {
+              const params = new URLSearchParams({
+                archived: "true", // include [Old] maps - valid non-obsolete submissions on them still count
+                undetermined: "false", // exclude challenges without a settled tier
+                min_diff_sort: "-1",
+                max_diff_sort: "999",
+                sub_count_is_min: "false",
+                clear_state: "0",
+                player: player.id,
+              });
+              const listRes = await fetch(`${GB_API_BASE}/lists/top-golden-list?${params}`);
+              if (!listRes.ok) throw new Error(`Request failed (${listRes.status})`);
+              const listData = await listRes.json();
+
+              setActivePlayer(player);
+              setPlays(buildPlaysFromTopGoldenList(listData));
+            } catch (err) {
+              setLoadPlayerError(
+                `Couldn't load ${player.name}'s Top 25. ${err.message}`
+              );
+            } finally {
+              setIsLoadingPlayer(false);
+            }
+          };
+
+          const resetToManual = () => {
+            setActivePlayer(null);
+            setLoadPlayerError(null);
+            setPlays([]);
+          };
+
+          const handleDragStart = (e, tier) => {
+            e.dataTransfer.setData('tier', tier.toString());
+            e.dataTransfer.effectAllowed = 'copy';
+          };
+
+          const handleDragOver = (e) => {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'copy';
+            setIsDraggingOver(true);
+          };
+
+          const handleDragLeave = () => {
+            setIsDraggingOver(false);
+          };
+
+          const addPlay = (tier) => {
+            setPlays((prev) => {
+              const nextPlays = [...prev, tier];
+              return nextPlays.sort((a, b) => b - a).slice(0, MAX_PLAYS);
+            });
+          };
+
+          const handleDrop = (e) => {
+            e.preventDefault();
+            setIsDraggingOver(false);
+            const tier = parseInt(e.dataTransfer.getData('tier'), 10);
+            
+            if (!isNaN(tier)) {
+              addPlay(tier);
+            }
+          };
+
+          const removePlay = (indexToRemove) => {
+            setPlays((prev) => prev.filter((_, i) => i !== indexToRemove));
+          };
+
+          const clearPlays = () => {
+            setPlays([]);
+          };
+
+          const stats = useMemo(() => {
+            let total = 0;
+            const details = plays.map((t, i) => {
+              const base = getBasePP(t);
+              const weighted = getWeightedPP(t, i);
+              total += weighted;
+              return { tier: t, base, weighted, weightFactor: Math.pow(w, i) };
+            });
+            return { total, details };
+          }, [plays]);
+
+          return (
+            <div className="min-h-screen bg-gradient-to-br from-[#12121a] to-[#0a0a0f] text-slate-200 font-sans p-6 overflow-x-hidden flex flex-col items-center">
+              
+              <div className="max-w-7xl w-full mb-6 flex flex-col md:flex-row md:items-end justify-between border-b border-white/5 pb-4">
+                <div>
+                  <h1 className="text-4xl font-black tracking-tighter text-white drop-shadow-md">
+                    the <span className="text-transparent bg-clip-text bg-gradient-to-r from-purple-400 to-pink-500">pp</span>alculator
+                  </h1>
+                  <p className="text-slate-500 text-sm mt-1 font-medium tracking-wide">Celeste Performance Points Calculator</p>
+                </div>
+              </div>
+
+              <div className="max-w-7xl w-full grid grid-cols-1 lg:grid-cols-12 gap-6">
+                
+                <div className="lg:col-span-4 flex flex-col gap-6">
+                  <div className="bg-[#1b1c2b] rounded-2xl p-6 shadow-xl border border-white/5 relative">
+                    <h2 className="text-xl font-bold mb-4 tracking-wide text-white/90">Look Up a Player</h2>
+                    <p className="text-sm text-slate-400 mb-4">Search a name to load their Top 25 and try your own adjustments.</p>
+
+                    <div className="relative">
+                      <input
+                        type="text"
+                        value={searchQuery}
+                        onChange={(e) => {
+                          setSearchQuery(e.target.value);
+                          setShowResults(true);
+                        }}
+                        onFocus={() => setShowResults(true)}
+                        onBlur={() => setTimeout(() => setShowResults(false), 150)}
+                        placeholder="Search player name..."
+                        className="w-full bg-[#0f1018] border border-white/10 rounded-xl px-4 py-3 text-sm text-slate-200 placeholder-slate-600 focus:outline-none focus:border-pink-500/50 transition-colors"
+                      />
+                      {isSearching && (
+                        <div className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 text-xs">
+                          searching…
+                        </div>
+                      )}
+
+                      {showResults && searchQuery.trim().length >= 2 && (
+                        <div className="absolute z-10 mt-2 w-full bg-[#0f1018] border border-white/10 rounded-xl shadow-2xl overflow-hidden max-h-64 overflow-y-auto">
+                          {searchError && (
+                            <div className="px-4 py-3 text-xs text-pink-400">{searchError}</div>
+                          )}
+                          {!searchError && !isSearching && searchResults.length === 0 && (
+                            <div className="px-4 py-3 text-xs text-slate-500">No players found.</div>
+                          )}
+                          {searchResults.map((player) => (
+                            <button
+                              key={player.id}
+                              onClick={() => loadPlayer(player)}
+                              className="w-full text-left px-4 py-3 text-sm text-slate-200 hover:bg-white/5 transition-colors border-b border-white/5 last:border-b-0"
+                            >
+                              {player.name}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    {isLoadingPlayer && (
+                      <p className="text-xs text-slate-500 mt-3">Loading player stats…</p>
+                    )}
+                    {loadPlayerError && (
+                      <p className="text-xs text-pink-400 mt-3">{loadPlayerError}</p>
+                    )}
+
+                    {activePlayer && (
+                      <div className="mt-4 flex items-center justify-between bg-[#0f1018] rounded-xl px-4 py-3">
+                        <div className="text-sm">
+                          <span className="text-slate-500">Viewing: </span>
+                          <span className="font-bold text-white">{activePlayer.name}</span>
+                        </div>
+                        <button
+                          onClick={resetToManual}
+                          className="text-xs uppercase tracking-wider font-semibold text-pink-400 hover:text-pink-300 transition-colors"
+                        >
+                          Reset
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="bg-[#1b1c2b] rounded-2xl p-6 shadow-xl border border-white/5">
+                    <h2 className="text-xl font-bold mb-4 tracking-wide text-white/90">Available Tiers</h2>
+                    <p className="text-sm text-slate-400 mb-6">Click or drag bubbles into your Top 25 dropzone to calculate PP.</p>
+                    <div className="grid grid-cols-5 gap-3">
+                      {availableTiers.map((tier) => (
+                        <div
+                          key={`avail-${tier}`}
+                          draggable
+                          onDragStart={(e) => handleDragStart(e, tier)}
+                          onClick={() => addPlay(tier)}
+                          className="relative w-12 h-12 rounded-full flex items-center justify-center font-bold text-slate-900 cursor-pointer hover:scale-110 transition-transform shadow-lg"
+                          style={{ backgroundColor: getTierColor(tier) }}
+                        >
+                          {tier}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="lg:col-span-8 flex flex-col gap-6">
+                  
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div className="bg-[#1b1c2b] rounded-2xl p-6 shadow-xl border border-white/5 flex flex-col justify-center">
+                      <h3 className="text-sm font-semibold text-slate-400 uppercase tracking-widest mb-1">Total Performance</h3>
+                      <div className="text-5xl font-black text-transparent bg-clip-text bg-gradient-to-r from-purple-400 to-pink-500">
+                        {stats.total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} <span className="text-2xl text-slate-500 font-bold">pp</span>
+                      </div>
+                    </div>
+                    
+                    <div className="bg-[#1b1c2b] rounded-2xl p-6 shadow-xl border border-white/5 flex flex-col justify-center">
+                      <h3 className="text-sm font-semibold text-slate-400 uppercase tracking-widest mb-1">Achievements Counted</h3>
+                      <div className="text-5xl font-black text-white">
+                        {plays.length} <span className="text-2xl text-slate-500 font-bold">/ {MAX_PLAYS}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="bg-[#1b1c2b] rounded-2xl p-6 shadow-xl border border-white/5 flex flex-col gap-4">
+                    <h3 className="text-sm font-semibold text-slate-400 uppercase tracking-widest">Weight Distribution</h3>
+                    {plays.length > 0 ? (
+                      <div className="w-full h-8 rounded-full overflow-hidden flex bg-[#0f1018]">
+                        {stats.details.map((play, i) => (
+                          <div
+                            key={`bar-${i}`}
+                            style={{
+                              width: `${(play.weighted / stats.total) * 100}%`,
+                              backgroundColor: getTierColor(play.tier)
+                            }}
+                            className="h-full border-r border-black/20 hover:opacity-80 transition-opacity cursor-pointer"
+                            title={`Tier ${play.tier} - ${play.weighted.toFixed(2)} pp`}
+                          />
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="w-full h-8 rounded-full bg-[#0f1018] flex items-center justify-center text-xs text-slate-600">
+                        Add achievements to view distribution
+                      </div>
+                    )}
+                  </div>
+
+                  <div 
+                    className={`bg-[#1b1c2b] rounded-2xl p-6 shadow-xl border transition-colors flex flex-col gap-6 flex-grow ${
+                      isDraggingOver ? 'border-pink-500/50 bg-[#222336]' : 'border-white/5'
+                    }`}
+                    onDragOver={handleDragOver}
+                    onDragLeave={handleDragLeave}
+                    onDrop={handleDrop}
+                  >
+                    <div className="flex justify-between items-end">
+                      <div>
+                        <h3 className="text-xl font-bold text-white/90">
+                          {activePlayer ? `${activePlayer.name}'s Top 25` : "Top 25 Achievements"}
+                        </h3>
+                        <p className="text-sm text-slate-400 mt-1">
+                          {activePlayer
+                            ? "Adjust freely to see how it would change their score."
+                            : "Click an active bubble to remove it."}
+                        </p>
+                      </div>
+                      {plays.length > 0 && (
+                        <button 
+                          onClick={clearPlays}
+                          className="text-xs uppercase tracking-wider font-semibold text-pink-400 hover:text-pink-300 transition-colors"
+                        >
+                          Clear All
+                        </button>
+                      )}
+                    </div>
+
+                    <div className="grid grid-cols-5 md:grid-cols-8 gap-4 min-h-[160px] content-start">
+                      {Array.from({ length: MAX_PLAYS }).map((_, i) => {
+                        const play = plays[i];
+                        return (
+                          <div 
+                            key={`slot-${i}`}
+                            className="flex flex-col items-center gap-2"
+                          >
+                            {play ? (
+                              <div
+                                onClick={() => removePlay(i)}
+                                className="w-14 h-14 rounded-full flex items-center justify-center font-bold text-slate-900 shadow-lg cursor-pointer hover:scale-95 transition-transform relative group"
+                                style={{ backgroundColor: getTierColor(play) }}
+                              >
+                                <span className="text-lg">{play}</span>
+                                <div className="absolute inset-0 bg-black/40 rounded-full opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity">
+                                  <span className="text-white text-xl">×</span>
+                                </div>
+                              </div>
+                            ) : (
+                              <div className="w-14 h-14 rounded-full border-2 border-dashed border-slate-700 bg-slate-800/30 flex items-center justify-center text-slate-600 text-sm">
+                                #{i + 1}
+                              </div>
+                            )}
+                            
+                            {play && (
+                              <div className="text-[10px] font-mono text-slate-400 flex flex-col items-center leading-tight">
+                                <span className="text-slate-200">{stats.details[i].weighted.toFixed(0)}pp</span>
+                                <span>{(stats.details[i].weightFactor * 100).toFixed(0)}% wt</span>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                </div>
+              </div>
+            </div>
+          );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
